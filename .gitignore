@@ -1,0 +1,14 @@
+node_modules/
+__pycache__/
+.DS_Store
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.coverage
+htmlcov/
+dist/
+build/
+md-to-pdf/
+*.pdf
+*.tmp

@@ -1,0 +1,7 @@
+{
+  "theme": "default",
+  "themeVariables": {
+    "fontFamily": "Noto Sans CJK SC, Noto Sans SC, sans-serif",
+    "fontSize": "14px"
+  }
+}
