@@ -23,6 +23,7 @@ technical specifications.
 
 - Converts `.md` to PDF with Chromium-based rendering
 - Renders Mermaid code fences, including indented fences inside list items
+- Supports YAML front matter for PDF, browser, Mermaid, and wrapper settings
 - Inlines Mermaid SVGs to preserve vector quality
 - Preserves relative Markdown and HTML asset references
 - Adds page numbers to every page
@@ -43,6 +44,7 @@ technical specifications.
 - Python `3.10+`
 - Node.js `18+`
 - `npm`
+- Python packages from `requirements.txt`
 - A working Chrome or Chromium installation, or a CI step that installs one
 
 The script also respects these environment variables:
@@ -56,11 +58,19 @@ The script also respects these environment variables:
 ```bash
 cd <repo-root>
 npm ci
+pip install -r requirements.txt
+```
+
+For tests and bookmark assertions:
+
+```bash
 pip install -r requirements-test.txt
 ```
 
-`requirements-test.txt` contains `pypdf`, which is optional for conversion but
-required for the test suite and bookmark assertions.
+`requirements.txt` contains the runtime parser dependencies used for AST-based
+Markdown processing and YAML front matter support. `requirements-test.txt`
+adds `pypdf`, which is optional for conversion but required for the test suite
+and bookmark assertions.
 
 ## Usage
 
@@ -69,6 +79,38 @@ python3 scripts/md_to_pdf.py input.md
 python3 scripts/md_to_pdf.py input.md output.pdf
 python3 scripts/md_to_pdf.py input.md output.pdf --img-dir build/mermaid --max-size 12
 ```
+
+## Front matter
+
+The wrapper accepts upstream-style `md-to-pdf` options at the top level and its
+own wrapper-specific options under `md_to_pdf`:
+
+```yaml
+---
+stylesheet:
+  - ./print-overrides.css
+pdf_options:
+  format: Letter
+  margin:
+    top: 16mm
+launch_options:
+  args:
+    - --lang=en-US
+md_to_pdf:
+  img_dir: build/mermaid
+  max_size: 12
+  mermaid_config: ./templates/mermaid.json
+  puppeteer_config: ./puppeteer.json
+---
+```
+
+Supported wrapper keys:
+
+- `md_to_pdf.img_dir`
+- `md_to_pdf.max_size`
+- `md_to_pdf.mermaid_config`
+- `md_to_pdf.puppeteer_config`
+- `md_to_pdf.stylesheet` or `md_to_pdf.stylesheets`
 
 Default output goes to:
 
@@ -112,6 +154,7 @@ The suite covers:
 
 - nested Mermaid fences
 - relative asset preservation
+- front matter settings and output paths
 - browser executable detection precedence
 
 ## CI
