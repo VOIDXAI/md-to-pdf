@@ -1,0 +1,10 @@
+{
+  "private": true,
+  "scripts": {
+    "test": "python3 -m unittest discover -s tests -v"
+  },
+  "dependencies": {
+    "@mermaid-js/mermaid-cli": "^11",
+    "md-to-pdf": "^5"
+  }
+}
