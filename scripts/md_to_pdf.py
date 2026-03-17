@@ -170,6 +170,41 @@ def _merge_ranges(ranges):
     return merged
 
 
+def _find_inline_code_ranges(text):
+    """Locate backtick-delimited inline code spans within a text chunk."""
+    ranges = []
+    cursor = 0
+    length = len(text)
+
+    while cursor < length:
+        if text[cursor] != "`":
+            cursor += 1
+            continue
+
+        tick_count = 1
+        while cursor + tick_count < length and text[cursor + tick_count] == "`":
+            tick_count += 1
+        fence = "`" * tick_count
+
+        search_pos = cursor + tick_count
+        while True:
+            closing = text.find(fence, search_pos)
+            if closing == -1:
+                cursor += tick_count
+                break
+
+            before = closing - 1
+            after = closing + tick_count
+            if (before < 0 or text[before] != "`") and (after >= length or text[after] != "`"):
+                ranges.append((cursor, after))
+                cursor = after
+                break
+
+            search_pos = closing + 1
+
+    return ranges
+
+
 def _sub_outside_ranges(pattern, repl, src, protected_ranges):
     """Apply re.sub only to text outside protected character ranges."""
     protected_ranges = _merge_ranges(protected_ranges)
@@ -481,24 +516,37 @@ def rewrite_relative_urls(src: str, src_path: str, proc_md: str, structure=None)
             f"{m.group('quote')}"
         )
 
+    def _rewrite_chunk(chunk):
+        inline_ranges = _merge_ranges(_find_inline_code_ranges(chunk))
+        pieces = []
+        piece_cursor = 0
+        for start, end in inline_ranges:
+            if piece_cursor < start:
+                segment = chunk[piece_cursor:start]
+                segment = MARKDOWN_LINK_RE.sub(_replace_markdown, segment)
+                segment = LINK_DEF_RE.sub(_replace_link_def, segment)
+                segment = HTML_URL_ATTR_RE.sub(_replace_html_attr, segment)
+                pieces.append(segment)
+            pieces.append(chunk[start:end])
+            piece_cursor = end
+        if piece_cursor < len(chunk):
+            segment = chunk[piece_cursor:]
+            segment = MARKDOWN_LINK_RE.sub(_replace_markdown, segment)
+            segment = LINK_DEF_RE.sub(_replace_link_def, segment)
+            segment = HTML_URL_ATTR_RE.sub(_replace_html_attr, segment)
+            pieces.append(segment)
+        return ''.join(pieces)
+
     protected_ranges = _merge_ranges(structure.code_ranges)
     chunks = []
     cursor = 0
     for start, end in protected_ranges:
         if cursor < start:
-            chunk = src[cursor:start]
-            chunk = MARKDOWN_LINK_RE.sub(_replace_markdown, chunk)
-            chunk = LINK_DEF_RE.sub(_replace_link_def, chunk)
-            chunk = HTML_URL_ATTR_RE.sub(_replace_html_attr, chunk)
-            chunks.append(chunk)
+            chunks.append(_rewrite_chunk(src[cursor:start]))
         chunks.append(src[start:end])
         cursor = end
     if cursor < len(src):
-        chunk = src[cursor:]
-        chunk = MARKDOWN_LINK_RE.sub(_replace_markdown, chunk)
-        chunk = LINK_DEF_RE.sub(_replace_link_def, chunk)
-        chunk = HTML_URL_ATTR_RE.sub(_replace_html_attr, chunk)
-        chunks.append(chunk)
+        chunks.append(_rewrite_chunk(src[cursor:]))
     return ''.join(chunks)
 
 
@@ -538,7 +586,11 @@ def render_diagrams(src: str, img_dir: str, mermaid_config_path=None, puppeteer_
         if puppeteer_cfg_path and os.path.isfile(puppeteer_cfg_path):
             mmdc_cmd.extend(["-p", puppeteer_cfg_path])
 
-        result = subprocess.run(mmdc_cmd, capture_output=True, text=True)
+        try:
+            result = subprocess.run(mmdc_cmd, capture_output=True, text=True, timeout=120)
+        except subprocess.TimeoutExpired:
+            print(f"  [WARN] d{idx:02d} timed out after 120s", flush=True)
+            continue
         if result.returncode != 0 or not os.path.exists(svg_path):
             print(f"  [WARN] d{idx:02d} failed: {result.stderr[:120]}", flush=True)
             continue
@@ -552,7 +604,8 @@ def render_diagrams(src: str, img_dir: str, mermaid_config_path=None, puppeteer_
         # Replace default "my-svg" id with unique per-diagram id to avoid
         # CSS selector conflicts when multiple SVGs are inlined in one page
         uid = f"mmd-{idx:02d}"
-        svg_content = svg_content.replace("my-svg", uid)
+        svg_content = svg_content.replace('id="my-svg"', f'id="{uid}"')
+        svg_content = svg_content.replace('#my-svg', f'#{uid}')
         replacement = f"\n\n<div class='mermaid-diagram'>\n{svg_content}\n</div>\n\n"
         lines[block.start_line:block.end_line] = _indent_block(
             replacement, block.indent
@@ -615,6 +668,9 @@ def _slugify(text):
     # Keep CJK, alphanumeric, spaces, hyphens
     text = re.sub(r'[^\w\u4e00-\u9fff\s-]', '', text)
     text = re.sub(r'[\s]+', '-', text)
+    text = text.strip("-")
+    if not text:
+        return "section"
     return text
 
 
@@ -670,7 +726,13 @@ def inject_heading_anchors(src):
         else:
             suffix = f" {anchor}" if body.strip() else anchor
             lines[heading.start_line] = f"{body}{suffix}{newline}"
-    return ''.join(lines)
+
+    links = ''.join(f'<a href="#{heading.slug}"> </a>' for heading in headings)
+    hidden_links = (
+        '\n\n<div style="height:0;overflow:hidden;font-size:0;line-height:0">'
+        f"{links}</div>\n"
+    )
+    return ''.join(lines) + hidden_links
 
 
 def add_bookmarks(out_path, src, headings=None):
@@ -729,30 +791,20 @@ def add_bookmarks(out_path, src, headings=None):
             bookmark = writer.add_outline_item(heading.title, page_num, parent=parent)
             parent_stack.append((heading.level, bookmark))
 
+        # Clear /Title metadata in the same write pass to avoid double read/write
+        writer.add_metadata({"/Title": ""})
+
         tmp_path = out_path + ".tmp"
         with open(tmp_path, "wb") as f:
             writer.write(f)
         os.replace(tmp_path, out_path)
-        print(f"  Added {len(headings)} bookmarks ({precise} precise, {len(headings)-precise} estimated)", flush=True)
+        estimated = len(headings) - precise
+        if precise == 0 and len(headings) > 0:
+            print(f"  [WARN] All {len(headings)} bookmarks used estimated page numbers (no named destinations found)", flush=True)
+        else:
+            print(f"  Added {len(headings)} bookmarks ({precise} precise, {estimated} estimated)", flush=True)
     except Exception as e:
         print(f"  [WARN] Bookmark generation failed: {e}", flush=True)
-
-
-def clear_pdf_title(out_path):
-    """Clear /Title metadata so Adobe Reader displays the OS filename."""
-    if not _PYPDF_OK:
-        return
-    try:
-        reader = PdfReader(out_path)
-        writer = PdfWriter()
-        writer.append(reader)
-        writer.add_metadata({"/Title": ""})
-        tmp_path = out_path + ".tmp"
-        with open(tmp_path, "wb") as f:
-            writer.write(f)
-        os.replace(tmp_path, out_path)
-    except Exception as e:
-        print(f"  [WARN] Metadata clear failed: {e}", flush=True)
 
 
 def main():
@@ -830,7 +882,6 @@ def main():
             )
 
         add_bookmarks(out_path, body, headings=structure.headings)
-        clear_pdf_title(out_path)
         size_mb = os.path.getsize(out_path) / 1024 / 1024
         print(f"Done! {out_path}  ({size_mb:.1f} MB)", flush=True)
     finally:
