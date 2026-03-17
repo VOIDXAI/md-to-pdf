@@ -682,5 +682,57 @@ class MermaidRenderTests(unittest.TestCase):
             self.assertTrue((img_dir / "d01.svg").exists())
 
 
+class GeneratePdfTests(unittest.TestCase):
+    def test_generate_pdf_retries_browser_launch_failures(self):
+        module = load_converter_module()
+        with tempfile.TemporaryDirectory(prefix="md-to-pdf-generate-") as tmpdir:
+            tmpdir_path = pathlib.Path(tmpdir)
+            proc_md = tmpdir_path / "processed_input.md"
+            proc_md.write_text("# Title\n", encoding="utf-8")
+            out_path = tmpdir_path / "output.pdf"
+            generated_pdf = proc_md.with_suffix(".pdf")
+            calls = []
+
+            def fake_run(cmd, capture_output, text):
+                calls.append(cmd)
+                if len(calls) == 1:
+                    return SimpleNamespace(
+                        returncode=1,
+                        stdout="",
+                        stderr="Error: Failed to launch the browser process!\n",
+                    )
+                generated_pdf.write_bytes(b"%PDF-1.4\n")
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            with mock.patch.object(module.subprocess, "run", side_effect=fake_run):
+                with mock.patch.object(module.time, "sleep") as sleep_mock:
+                    ok = module.generate_pdf(str(proc_md), str(out_path), launch_opts={})
+
+            self.assertTrue(ok)
+            self.assertEqual(len(calls), 2)
+            sleep_mock.assert_called_once_with(1)
+            self.assertTrue(out_path.exists())
+
+    def test_generate_pdf_does_not_retry_non_launch_errors(self):
+        module = load_converter_module()
+        with tempfile.TemporaryDirectory(prefix="md-to-pdf-generate-") as tmpdir:
+            tmpdir_path = pathlib.Path(tmpdir)
+            proc_md = tmpdir_path / "processed_input.md"
+            proc_md.write_text("# Title\n", encoding="utf-8")
+            out_path = tmpdir_path / "output.pdf"
+
+            with mock.patch.object(
+                module.subprocess,
+                "run",
+                return_value=SimpleNamespace(returncode=1, stdout="", stderr="syntax exploded"),
+            ) as run_mock:
+                with mock.patch.object(module.time, "sleep") as sleep_mock:
+                    ok = module.generate_pdf(str(proc_md), str(out_path), launch_opts={})
+
+            self.assertFalse(ok)
+            run_mock.assert_called_once()
+            sleep_mock.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()
