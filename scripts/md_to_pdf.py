@@ -28,6 +28,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.parse
 from dataclasses import dataclass
 
@@ -66,6 +67,7 @@ _MERMAID_CLI_VERSION = None
 DEFAULT_MERMAID_BATCH_SIZE = 4
 
 DEFAULT_PAGE_MEDIA_TYPE = "print"
+DEFAULT_MD_TO_PDF_RETRIES = 2
 DEFAULT_PDF_OPTIONS = {
     "format": "A4",
     "margin": {"top": "20mm", "bottom": "25mm", "left": "15mm", "right": "15mm"},
@@ -894,8 +896,22 @@ def generate_pdf(
     if basedir:
         cmd.extend(["--basedir", basedir])
     cmd.append(proc_md)
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
+
+    result = None
+    for attempt in range(DEFAULT_MD_TO_PDF_RETRIES + 1):
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode == 0:
+            break
+
+        stderr = result.stderr or ""
+        if "Failed to launch the browser process" in stderr and attempt < DEFAULT_MD_TO_PDF_RETRIES:
+            print(
+                f"  [WARN] md-to-pdf browser launch failed, retrying ({attempt + 1}/{DEFAULT_MD_TO_PDF_RETRIES})",
+                flush=True,
+            )
+            time.sleep(attempt + 1)
+            continue
+
         print(f"[ERROR] md-to-pdf failed:\n{result.stderr}", file=sys.stderr)
         return False
 
