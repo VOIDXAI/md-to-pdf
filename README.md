@@ -23,6 +23,9 @@ technical specifications.
 
 - Converts `.md` to PDF with Chromium-based rendering
 - Renders Mermaid code fences, including indented fences inside list items
+- Batch-renders Mermaid diagrams in a single browser session
+- Uses conservative Mermaid batches of 4 diagrams by default to avoid resource spikes
+- Reuses cached Mermaid SVGs across runs for much faster repeated exports
 - Supports YAML front matter for PDF, browser, Mermaid, and wrapper settings
 - Inlines Mermaid SVGs to preserve vector quality
 - Preserves relative Markdown and HTML asset references
@@ -78,6 +81,7 @@ and bookmark assertions.
 python3 scripts/md_to_pdf.py input.md
 python3 scripts/md_to_pdf.py input.md output.pdf
 python3 scripts/md_to_pdf.py input.md output.pdf --img-dir build/mermaid --max-size 12
+python3 scripts/md_to_pdf.py input.md output.pdf --performance-mode
 ```
 
 ## Front matter
@@ -110,6 +114,8 @@ Supported wrapper keys:
 - `md_to_pdf.max_size`
 - `md_to_pdf.mermaid_config`
 - `md_to_pdf.puppeteer_config`
+- `md_to_pdf.performance_mode` (`true` enables full-throttle Mermaid batching)
+- `md_to_pdf.cache_dir` (`false` disables persistent Mermaid caching)
 - `md_to_pdf.stylesheet` or `md_to_pdf.stylesheets`
 
 Default output goes to:

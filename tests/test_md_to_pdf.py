@@ -318,11 +318,13 @@ class FrontMatterTests(unittest.TestCase):
                     "max_size": 7.5,
                     "mermaid_config": "./custom-mermaid.json",
                     "puppeteer_config": "./custom-puppeteer.json",
+                    "cache_dir": "./cache/mermaid",
                 },
             }
             cli_args = SimpleNamespace(
                 img_dir=str(tmpdir_path / "cli-mermaid"),
                 max_size=9.0,
+                performance_mode=False,
             )
 
             with mock.patch.object(module, "_resolve_executable", return_value=sys.executable):
@@ -338,6 +340,50 @@ class FrontMatterTests(unittest.TestCase):
         self.assertEqual(settings["launch_options"]["headless"], False)
         self.assertEqual(settings["launch_options"]["args"], ["--lang=en-US"])
         self.assertEqual(settings["mermaid_config_path"], str(tmpdir_path / "custom-mermaid.json"))
+        self.assertEqual(settings["cache_dir"], str(tmpdir_path / "cache" / "mermaid"))
+        self.assertFalse(settings["performance_mode"])
+        self.assertEqual(settings["mermaid_batch_size"], 4)
+
+    def test_build_render_settings_allows_disabling_cache(self):
+        module = load_converter_module()
+        with tempfile.TemporaryDirectory(prefix="md-to-pdf-frontmatter-") as tmpdir:
+            tmpdir_path = pathlib.Path(tmpdir)
+            input_path = tmpdir_path / "input.md"
+            input_path.write_text("# Title\n", encoding="utf-8")
+
+            metadata = {"md_to_pdf": {"cache_dir": False}}
+            cli_args = SimpleNamespace(img_dir=None, max_size=None, performance_mode=False)
+            settings = module.build_render_settings(str(input_path), metadata, cli_args)
+
+        self.assertIsNone(settings["cache_dir"])
+
+    def test_build_render_settings_enables_performance_mode(self):
+        module = load_converter_module()
+        with tempfile.TemporaryDirectory(prefix="md-to-pdf-frontmatter-") as tmpdir:
+            tmpdir_path = pathlib.Path(tmpdir)
+            input_path = tmpdir_path / "input.md"
+            input_path.write_text("# Title\n", encoding="utf-8")
+
+            metadata = {"md_to_pdf": {"performance_mode": True}}
+            cli_args = SimpleNamespace(img_dir=None, max_size=None, performance_mode=False)
+            settings = module.build_render_settings(str(input_path), metadata, cli_args)
+
+        self.assertTrue(settings["performance_mode"])
+        self.assertIsNone(settings["mermaid_batch_size"])
+
+    def test_cli_performance_mode_overrides_default_batching(self):
+        module = load_converter_module()
+        with tempfile.TemporaryDirectory(prefix="md-to-pdf-frontmatter-") as tmpdir:
+            tmpdir_path = pathlib.Path(tmpdir)
+            input_path = tmpdir_path / "input.md"
+            input_path.write_text("# Title\n", encoding="utf-8")
+
+            metadata = {}
+            cli_args = SimpleNamespace(img_dir=None, max_size=None, performance_mode=True)
+            settings = module.build_render_settings(str(input_path), metadata, cli_args)
+
+        self.assertTrue(settings["performance_mode"])
+        self.assertIsNone(settings["mermaid_batch_size"])
 
     def test_rewrite_relative_urls_preserves_code_fences_after_prior_rewrites(self):
         module = load_converter_module()
@@ -392,6 +438,248 @@ class FrontMatterTests(unittest.TestCase):
 
         self.assertIn('<img src="../assets/diagram.svg" alt="Diagram">', rewritten)
         self.assertIn('<a href="../docs/spec.html">Spec</a>', rewritten)
+
+
+class MermaidRenderTests(unittest.TestCase):
+    def test_render_diagrams_batches_and_reuses_cache(self):
+        module = load_converter_module()
+        src = textwrap.dedent(
+            """
+            # Demo
+
+            ```mermaid
+            graph TD
+                Start --> End
+            ```
+
+            ```mermaid
+            graph TD
+                Left --> Right
+            ```
+            """
+        ).lstrip()
+        structure = module.parse_markdown_structure(src)
+
+        with tempfile.TemporaryDirectory(prefix="md-to-pdf-mermaid-") as tmpdir:
+            tmpdir_path = pathlib.Path(tmpdir)
+            img_dir = tmpdir_path / "img"
+            cache_dir = tmpdir_path / "cache"
+            calls = []
+
+            def fake_run(cmd, capture_output, text, timeout):
+                calls.append(cmd)
+                batch_output = pathlib.Path(cmd[cmd.index("-o") + 1])
+                artefacts_dir = pathlib.Path(cmd[cmd.index("-a") + 1])
+                artefacts_dir.mkdir(parents=True, exist_ok=True)
+                for offset, label in enumerate(("Start", "Left"), start=1):
+                    (artefacts_dir / f"{batch_output.stem}-{offset}.svg").write_text(
+                        (
+                            '<svg xmlns="http://www.w3.org/2000/svg" id="my-svg">'
+                            f"<text>{label}</text></svg>"
+                        ),
+                        encoding="utf-8",
+                    )
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            with mock.patch.object(module.subprocess, "run", side_effect=fake_run):
+                rendered = module.render_diagrams(
+                    src,
+                    str(img_dir),
+                    structure=structure,
+                    cache_dir=str(cache_dir),
+                )
+
+            self.assertEqual(len(calls), 1)
+            self.assertIn('id="mmd-00"', rendered)
+            self.assertIn('id="mmd-01"', rendered)
+            self.assertIn("Start", rendered)
+            self.assertIn("Left", rendered)
+            self.assertEqual(len(list(cache_dir.rglob("*.svg"))), 2)
+
+            img_dir_second = tmpdir_path / "img-second"
+            with mock.patch.object(module.subprocess, "run") as run_mock:
+                rendered_second = module.render_diagrams(
+                    src,
+                    str(img_dir_second),
+                    structure=structure,
+                    cache_dir=str(cache_dir),
+                )
+
+            run_mock.assert_not_called()
+            self.assertIn('id="mmd-00"', rendered_second)
+            self.assertIn('id="mmd-01"', rendered_second)
+            self.assertTrue((img_dir_second / "d00.svg").exists())
+            self.assertTrue((img_dir_second / "d01.svg").exists())
+
+    def test_render_diagrams_uses_conservative_default_batch_size(self):
+        module = load_converter_module()
+        src = textwrap.dedent(
+            """
+            ```mermaid
+            graph TD
+                A --> B
+            ```
+
+            ```mermaid
+            graph TD
+                C --> D
+            ```
+
+            ```mermaid
+            graph TD
+                E --> F
+            ```
+
+            ```mermaid
+            graph TD
+                G --> H
+            ```
+
+            ```mermaid
+            graph TD
+                I --> J
+            ```
+            """
+        ).lstrip()
+        structure = module.parse_markdown_structure(src)
+
+        with tempfile.TemporaryDirectory(prefix="md-to-pdf-mermaid-") as tmpdir:
+            img_dir = pathlib.Path(tmpdir) / "img"
+            calls = []
+
+            def fake_run(cmd, capture_output, text, timeout):
+                calls.append(cmd)
+                batch_output = pathlib.Path(cmd[cmd.index("-o") + 1])
+                artefacts_dir = pathlib.Path(cmd[cmd.index("-a") + 1])
+                artefacts_dir.mkdir(parents=True, exist_ok=True)
+                batch_size = 4 if len(calls) == 1 else 1
+                for offset in range(1, batch_size + 1):
+                    label = f"batch-{len(calls)}-{offset}"
+                    (artefacts_dir / f"{batch_output.stem}-{offset}.svg").write_text(
+                        (
+                            '<svg xmlns="http://www.w3.org/2000/svg" id="my-svg">'
+                            f"<text>{label}</text></svg>"
+                        ),
+                        encoding="utf-8",
+                    )
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            with mock.patch.object(module.subprocess, "run", side_effect=fake_run):
+                rendered = module.render_diagrams(src, str(img_dir), structure=structure)
+
+            self.assertEqual(len(calls), 2)
+            self.assertIn("batch-1-1", rendered)
+            self.assertIn("batch-2-1", rendered)
+            self.assertTrue((img_dir / "d04.svg").exists())
+
+    def test_render_diagrams_performance_mode_uses_single_batch(self):
+        module = load_converter_module()
+        src = textwrap.dedent(
+            """
+            ```mermaid
+            graph TD
+                A --> B
+            ```
+
+            ```mermaid
+            graph TD
+                C --> D
+            ```
+
+            ```mermaid
+            graph TD
+                E --> F
+            ```
+
+            ```mermaid
+            graph TD
+                G --> H
+            ```
+
+            ```mermaid
+            graph TD
+                I --> J
+            ```
+            """
+        ).lstrip()
+        structure = module.parse_markdown_structure(src)
+
+        with tempfile.TemporaryDirectory(prefix="md-to-pdf-mermaid-") as tmpdir:
+            img_dir = pathlib.Path(tmpdir) / "img"
+            calls = []
+
+            def fake_run(cmd, capture_output, text, timeout):
+                calls.append(cmd)
+                batch_output = pathlib.Path(cmd[cmd.index("-o") + 1])
+                artefacts_dir = pathlib.Path(cmd[cmd.index("-a") + 1])
+                artefacts_dir.mkdir(parents=True, exist_ok=True)
+                for offset in range(1, 6):
+                    (artefacts_dir / f"{batch_output.stem}-{offset}.svg").write_text(
+                        (
+                            '<svg xmlns="http://www.w3.org/2000/svg" id="my-svg">'
+                            f"<text>perf-{offset}</text></svg>"
+                        ),
+                        encoding="utf-8",
+                    )
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            with mock.patch.object(module.subprocess, "run", side_effect=fake_run):
+                rendered = module.render_diagrams(
+                    src,
+                    str(img_dir),
+                    structure=structure,
+                    batch_size=None,
+                )
+
+            self.assertEqual(len(calls), 1)
+            self.assertIn("perf-5", rendered)
+
+    def test_render_diagrams_falls_back_to_single_render_on_batch_failure(self):
+        module = load_converter_module()
+        src = textwrap.dedent(
+            """
+            ```mermaid
+            graph TD
+                One --> Two
+            ```
+
+            ```mermaid
+            graph TD
+                Three --> Four
+            ```
+            """
+        ).lstrip()
+        structure = module.parse_markdown_structure(src)
+
+        with tempfile.TemporaryDirectory(prefix="md-to-pdf-mermaid-") as tmpdir:
+            img_dir = pathlib.Path(tmpdir) / "img"
+            calls = []
+
+            def fake_run(cmd, capture_output, text, timeout):
+                calls.append(cmd)
+                output_path = pathlib.Path(cmd[cmd.index("-o") + 1])
+                if "-a" in cmd:
+                    return SimpleNamespace(returncode=1, stdout="", stderr="batch failed")
+
+                label = "One" if output_path.name == "d00.svg" else "Three"
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                output_path.write_text(
+                    (
+                        '<svg xmlns="http://www.w3.org/2000/svg" id="my-svg">'
+                        f"<text>{label}</text></svg>"
+                    ),
+                    encoding="utf-8",
+                )
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            with mock.patch.object(module.subprocess, "run", side_effect=fake_run):
+                rendered = module.render_diagrams(src, str(img_dir), structure=structure)
+
+            self.assertEqual(len(calls), 3)
+            self.assertIn("One", rendered)
+            self.assertIn("Three", rendered)
+            self.assertTrue((img_dir / "d00.svg").exists())
+            self.assertTrue((img_dir / "d01.svg").exists())
 
 
 if __name__ == "__main__":

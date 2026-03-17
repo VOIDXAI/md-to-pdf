@@ -20,6 +20,7 @@ Dependencies:
 
 import argparse
 import copy
+import hashlib
 import json
 import os
 import re
@@ -55,6 +56,14 @@ _NODE_BIN = os.path.join(_SKILL_DIR, "node_modules", ".bin")
 _PUPPETEER_CFG = os.path.join(_SKILL_DIR, "puppeteer-config.json")
 _MERMAID_CFG = os.path.join(_SKILL_DIR, "templates", "mermaid-config.json")
 _STYLESHEET = os.path.join(_SKILL_DIR, "templates", "technical.css")
+_DEFAULT_CACHE_DIR = os.path.join(
+    os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")),
+    "md-to-pdf",
+    "mermaid",
+)
+_MERMAID_CACHE_SCHEMA = "v2"
+_MERMAID_CLI_VERSION = None
+DEFAULT_MERMAID_BATCH_SIZE = 4
 
 DEFAULT_PAGE_MEDIA_TYPE = "print"
 DEFAULT_PDF_OPTIONS = {
@@ -75,6 +84,80 @@ def _find_tool(name):
     """Find a tool in local node_modules/.bin, fall back to PATH."""
     local = os.path.join(_NODE_BIN, name)
     return local if os.path.isfile(local) and os.access(local, os.X_OK) else name
+
+
+def _read_file_bytes(path):
+    """Read a file as bytes when it exists, otherwise return empty bytes."""
+    if path and os.path.isfile(path):
+        with open(path, "rb") as f:
+            return f.read()
+    return b""
+
+
+def _mermaid_cli_version():
+    """Return the installed mermaid-cli version for cache invalidation."""
+    global _MERMAID_CLI_VERSION
+    if _MERMAID_CLI_VERSION is None:
+        package_json = os.path.join(
+            _SKILL_DIR, "node_modules", "@mermaid-js", "mermaid-cli", "package.json"
+        )
+        try:
+            with open(package_json, encoding="utf-8") as f:
+                _MERMAID_CLI_VERSION = json.load(f).get("version", "unknown")
+        except Exception:
+            _MERMAID_CLI_VERSION = "unknown"
+    return _MERMAID_CLI_VERSION
+
+
+def _normalize_cache_dir(value, base_dir):
+    """Resolve cache_dir settings, allowing False/None to disable caching."""
+    if value in (None, True):
+        return _DEFAULT_CACHE_DIR
+    if value in (False, ""):
+        return None
+    return _resolve_path(value, base_dir)
+
+
+def _normalize_bool(value, default=False):
+    """Normalize truthy configuration values from YAML/CLI."""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"1", "true", "yes", "on"}:
+            return True
+        if lowered in {"0", "false", "no", "off"}:
+            return False
+    return bool(value)
+
+
+def _mermaid_cache_key(block_content, mermaid_config_bytes):
+    """Compute a stable cache key for rendered Mermaid SVG output."""
+    digest = hashlib.sha256()
+    digest.update(_MERMAID_CACHE_SCHEMA.encode("utf-8"))
+    digest.update(b"\0")
+    digest.update(_mermaid_cli_version().encode("utf-8"))
+    digest.update(b"\0")
+    digest.update(mermaid_config_bytes)
+    digest.update(b"\0")
+    digest.update(block_content.encode("utf-8"))
+    return digest.hexdigest()
+
+
+def _mermaid_cache_path(cache_dir, cache_key):
+    """Place cache entries into sharded subdirectories."""
+    return os.path.join(cache_dir, cache_key[:2], f"{cache_key}.svg")
+
+
+def _store_mermaid_cache(cache_dir, cache_key, svg_path):
+    """Copy a freshly rendered SVG into the persistent cache."""
+    if not cache_dir or not os.path.exists(svg_path):
+        return
+    cache_path = _mermaid_cache_path(cache_dir, cache_key)
+    os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+    shutil.copyfile(svg_path, cache_path)
 
 
 MARKDOWN_LINK_RE = re.compile(
@@ -448,6 +531,7 @@ def build_render_settings(src_path, metadata, cli_args):
 
     launch_inline = _deep_merge(metadata.get("launch_options") or {}, wrapper_config.get("launch_options") or {})
     max_size = _normalize_max_size(wrapper_config.get("max_size"))
+    performance_mode = _normalize_bool(wrapper_config.get("performance_mode"), default=False)
 
     settings = {
         "stylesheets": stylesheets,
@@ -465,6 +549,9 @@ def build_render_settings(src_path, metadata, cli_args):
             inline_options=launch_inline,
         ),
         "mermaid_config_path": _resolve_path(wrapper_config.get("mermaid_config"), src_dir) or _MERMAID_CFG,
+        "cache_dir": _normalize_cache_dir(wrapper_config.get("cache_dir"), src_dir),
+        "performance_mode": performance_mode,
+        "mermaid_batch_size": None if performance_mode else DEFAULT_MERMAID_BATCH_SIZE,
         "img_dir": _resolve_path(wrapper_config.get("img_dir"), src_dir),
         "max_size": max_size,
     }
@@ -473,6 +560,9 @@ def build_render_settings(src_path, metadata, cli_args):
         settings["img_dir"] = os.path.abspath(cli_args.img_dir)
     if cli_args.max_size is not None:
         settings["max_size"] = float(cli_args.max_size)
+    if getattr(cli_args, "performance_mode", False):
+        settings["performance_mode"] = True
+        settings["mermaid_batch_size"] = None
     if settings["max_size"] is None:
         settings["max_size"] = 10.0
     return settings
@@ -563,23 +653,90 @@ def make_processing_paths(src_path: str, src_stem: str):
     return proc_root, proc_md, basedir
 
 
-def render_diagrams(src: str, img_dir: str, mermaid_config_path=None, puppeteer_cfg_path=None, structure=None) -> str:
-    """Replace mermaid fences with rendered SVG image references."""
-    structure = structure or parse_markdown_structure(src)
-    if not structure.mermaid_blocks:
-        return src
+def _inline_svg_markup(svg_path, idx):
+    """Read an SVG and rewrite its default IDs for safe inline embedding."""
+    with open(svg_path, "r", encoding="utf-8") as sf:
+        svg_content = sf.read()
+    svg_content = re.sub(r'<\?xml[^?]*\?>\s*', '', svg_content)
+    uid = f"mmd-{idx:02d}"
+    svg_content = svg_content.replace('id="my-svg"', f'id="{uid}"')
+    svg_content = svg_content.replace('#my-svg', f'#{uid}')
+    return svg_content
 
-    os.makedirs(img_dir, exist_ok=True)
-    lines = src.splitlines(True)
 
-    for idx, block in reversed(list(enumerate(structure.mermaid_blocks))):
-        mmd_path = os.path.join(img_dir, f"d{idx:02d}.mmd")
-        svg_path = os.path.join(img_dir, f"d{idx:02d}.svg")
+def _render_single_mermaid_block(
+    idx,
+    block,
+    img_dir,
+    mermaid_config_path=None,
+    puppeteer_cfg_path=None,
+    cache_dir=None,
+    cache_key=None,
+):
+    """Render one Mermaid block as a compatibility fallback."""
+    svg_path = os.path.join(img_dir, f"d{idx:02d}.svg")
+    mmdc_cmd = [_find_tool("mmdc"), "-i", os.path.join(img_dir, f"d{idx:02d}.mmd"), "-o", svg_path, "-b", "white"]
+    cfg_path = mermaid_config_path or _MERMAID_CFG
+    if cfg_path and os.path.isfile(cfg_path):
+        mmdc_cmd.extend(["--configFile", cfg_path])
+    if puppeteer_cfg_path and os.path.isfile(puppeteer_cfg_path):
+        mmdc_cmd.extend(["-p", puppeteer_cfg_path])
 
-        with open(mmd_path, "w", encoding="utf-8") as f:
-            f.write(block.content)
+    try:
+        result = subprocess.run(mmdc_cmd, capture_output=True, text=True, timeout=120)
+    except subprocess.TimeoutExpired:
+        print(f"  [WARN] d{idx:02d} timed out after 120s", flush=True)
+        return False
+    if result.returncode != 0 or not os.path.exists(svg_path):
+        print(f"  [WARN] d{idx:02d} failed: {result.stderr[:120]}", flush=True)
+        return False
 
-        mmdc_cmd = [_find_tool("mmdc"), "-i", mmd_path, "-o", svg_path, "-b", "white"]
+    if cache_dir and cache_key:
+        _store_mermaid_cache(cache_dir, cache_key, svg_path)
+    print(f"  [OK] d{idx:02d}.svg", flush=True)
+    return True
+
+
+def _render_mermaid_batch(
+    indices,
+    blocks,
+    img_dir,
+    mermaid_config_path=None,
+    puppeteer_cfg_path=None,
+    cache_dir=None,
+    cache_keys=None,
+):
+    """Render multiple Mermaid blocks in one mmdc invocation."""
+    if not indices:
+        return []
+
+    with tempfile.TemporaryDirectory(prefix="md-to-pdf-mermaid-") as batch_root:
+        batch_input = os.path.join(batch_root, "batch.md")
+        batch_output = os.path.join(batch_root, "rendered.md")
+        artefacts = os.path.join(batch_root, "artefacts")
+
+        parts = []
+        for idx in indices:
+            content = blocks[idx].content
+            if content and not content.endswith("\n"):
+                content += "\n"
+            parts.append(f"```mermaid\n{content}```\n")
+        with open(batch_input, "w", encoding="utf-8") as f:
+            f.write("\n".join(parts))
+
+        mmdc_cmd = [
+            _find_tool("mmdc"),
+            "-i",
+            batch_input,
+            "-o",
+            batch_output,
+            "-a",
+            artefacts,
+            "-e",
+            "svg",
+            "-b",
+            "white",
+        ]
         cfg_path = mermaid_config_path or _MERMAID_CFG
         if cfg_path and os.path.isfile(cfg_path):
             mmdc_cmd.extend(["--configFile", cfg_path])
@@ -587,25 +744,119 @@ def render_diagrams(src: str, img_dir: str, mermaid_config_path=None, puppeteer_
             mmdc_cmd.extend(["-p", puppeteer_cfg_path])
 
         try:
-            result = subprocess.run(mmdc_cmd, capture_output=True, text=True, timeout=120)
+            result = subprocess.run(
+                mmdc_cmd,
+                capture_output=True,
+                text=True,
+                timeout=max(120, 15 * len(indices)),
+            )
         except subprocess.TimeoutExpired:
-            print(f"  [WARN] d{idx:02d} timed out after 120s", flush=True)
-            continue
-        if result.returncode != 0 or not os.path.exists(svg_path):
-            print(f"  [WARN] d{idx:02d} failed: {result.stderr[:120]}", flush=True)
-            continue
+            print(
+                f"  [WARN] Batch Mermaid render timed out for {len(indices)} diagrams; falling back",
+                flush=True,
+            )
+            return list(indices)
 
-        print(f"  [OK] d{idx:02d}.svg", flush=True)
-        # Read SVG and inline it for vector-quality rendering in PDF
-        with open(svg_path, "r", encoding="utf-8") as sf:
-            svg_content = sf.read()
-        # Remove XML declaration if present, keep <svg> tag
-        svg_content = re.sub(r'<\?xml[^?]*\?>\s*', '', svg_content)
-        # Replace default "my-svg" id with unique per-diagram id to avoid
-        # CSS selector conflicts when multiple SVGs are inlined in one page
-        uid = f"mmd-{idx:02d}"
-        svg_content = svg_content.replace('id="my-svg"', f'id="{uid}"')
-        svg_content = svg_content.replace('#my-svg', f'#{uid}')
+        if result.returncode != 0:
+            stderr = result.stderr.strip() or result.stdout.strip()
+            print(f"  [WARN] Batch Mermaid render failed: {stderr[:160]}", flush=True)
+            return list(indices)
+
+        output_stem = os.path.splitext(os.path.basename(batch_output))[0]
+        failures = []
+        for offset, idx in enumerate(indices, start=1):
+            rendered_svg = os.path.join(artefacts, f"{output_stem}-{offset}.svg")
+            svg_path = os.path.join(img_dir, f"d{idx:02d}.svg")
+            if not os.path.exists(rendered_svg):
+                print(f"  [WARN] d{idx:02d} missing from batch output", flush=True)
+                failures.append(idx)
+                continue
+            shutil.copyfile(rendered_svg, svg_path)
+            if cache_dir and cache_keys and cache_keys.get(idx):
+                _store_mermaid_cache(cache_dir, cache_keys[idx], svg_path)
+            print(f"  [OK] d{idx:02d}.svg", flush=True)
+
+        return failures
+
+
+def _batched_indices(indices, batch_size):
+    """Yield work in bounded chunks unless performance mode disables chunking."""
+    if not batch_size or batch_size <= 0:
+        if indices:
+            yield list(indices)
+        return
+    for offset in range(0, len(indices), batch_size):
+        yield indices[offset:offset + batch_size]
+
+
+def render_diagrams(
+    src: str,
+    img_dir: str,
+    mermaid_config_path=None,
+    puppeteer_cfg_path=None,
+    structure=None,
+    cache_dir=None,
+    batch_size=DEFAULT_MERMAID_BATCH_SIZE,
+) -> str:
+    """Replace Mermaid fences with inline SVG while minimizing renderer startups."""
+    structure = structure or parse_markdown_structure(src)
+    if not structure.mermaid_blocks:
+        return src
+
+    os.makedirs(img_dir, exist_ok=True)
+    if cache_dir:
+        os.makedirs(cache_dir, exist_ok=True)
+
+    mermaid_config_bytes = _read_file_bytes(mermaid_config_path or _MERMAID_CFG)
+    cache_keys = {}
+    missing = []
+    for idx, block in enumerate(structure.mermaid_blocks):
+        mmd_path = os.path.join(img_dir, f"d{idx:02d}.mmd")
+        svg_path = os.path.join(img_dir, f"d{idx:02d}.svg")
+        with open(mmd_path, "w", encoding="utf-8") as f:
+            f.write(block.content)
+
+        if cache_dir:
+            cache_key = _mermaid_cache_key(block.content, mermaid_config_bytes)
+            cache_keys[idx] = cache_key
+            cache_path = _mermaid_cache_path(cache_dir, cache_key)
+            if os.path.exists(cache_path):
+                shutil.copyfile(cache_path, svg_path)
+                print(f"  [CACHE] d{idx:02d}.svg", flush=True)
+                continue
+
+        missing.append(idx)
+
+    failed = []
+    for batch_indices in _batched_indices(missing, batch_size):
+        failed.extend(
+            _render_mermaid_batch(
+                batch_indices,
+                structure.mermaid_blocks,
+                img_dir,
+                mermaid_config_path=mermaid_config_path,
+                puppeteer_cfg_path=puppeteer_cfg_path,
+                cache_dir=cache_dir,
+                cache_keys=cache_keys,
+            )
+        )
+    for idx in failed:
+        _render_single_mermaid_block(
+            idx,
+            structure.mermaid_blocks[idx],
+            img_dir,
+            mermaid_config_path=mermaid_config_path,
+            puppeteer_cfg_path=puppeteer_cfg_path,
+            cache_dir=cache_dir,
+            cache_key=cache_keys.get(idx),
+        )
+
+    lines = src.splitlines(True)
+    for idx, block in reversed(list(enumerate(structure.mermaid_blocks))):
+        svg_path = os.path.join(img_dir, f"d{idx:02d}.svg")
+        if not os.path.exists(svg_path):
+            continue
+        svg_content = _inline_svg_markup(svg_path, idx)
         replacement = f"\n\n<div class='mermaid-diagram'>\n{svg_content}\n</div>\n\n"
         lines[block.start_line:block.end_line] = _indent_block(
             replacement, block.indent
@@ -688,9 +939,9 @@ def _make_unique_slug(slug, seen):
     return unique
 
 
-def inject_heading_anchors(src):
+def inject_heading_anchors(src, headings=None):
     """Inject stable HTML anchors into heading lines so Chromium emits destinations."""
-    headings = collect_headings(src)
+    headings = headings or collect_headings(src)
     if not headings:
         return src
 
@@ -816,6 +1067,11 @@ def main():
                         help="Directory for rendered SVGs (default: <output_dir>/mermaid)")
     parser.add_argument("--max-size", type=float, default=None,
                         help="Max PDF size in MB (default: 10)")
+    parser.add_argument(
+        "--performance-mode",
+        action="store_true",
+        help="Use aggressive full-batch Mermaid rendering for maximum speed",
+    )
     args = parser.parse_args()
 
     src_path = os.path.abspath(args.input)
@@ -850,13 +1106,15 @@ def main():
     try:
         structure = parse_markdown_structure(body)
         processed = rewrite_relative_urls(body, src_path, proc_md, structure=structure)
-        processed = inject_heading_anchors(processed)
+        processed = inject_heading_anchors(processed, headings=structure.headings)
         processed = render_diagrams(
             processed,
             img_dir,
             mermaid_config_path=settings["mermaid_config_path"],
             puppeteer_cfg_path=runtime_puppeteer_cfg,
             structure=structure,
+            cache_dir=settings["cache_dir"],
+            batch_size=settings["mermaid_batch_size"],
         )
 
         with open(proc_md, "w", encoding="utf-8") as f:
