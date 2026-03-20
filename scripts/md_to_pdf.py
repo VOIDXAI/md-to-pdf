@@ -56,7 +56,9 @@ _SKILL_DIR = os.path.dirname(_SCRIPT_DIR)
 _NODE_BIN = os.path.join(_SKILL_DIR, "node_modules", ".bin")
 _PUPPETEER_CFG = os.path.join(_SKILL_DIR, "puppeteer-config.json")
 _MERMAID_CFG = os.path.join(_SKILL_DIR, "templates", "mermaid-config.json")
+_MERMAID_CFG_DARK = os.path.join(_SKILL_DIR, "templates", "mermaid-config-dark.json")
 _STYLESHEET = os.path.join(_SKILL_DIR, "templates", "technical.css")
+_STYLESHEET_DARK = os.path.join(_SKILL_DIR, "templates", "technical-dark.css")
 _DEFAULT_CACHE_DIR = os.path.join(
     os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")),
     "md-to-pdf",
@@ -68,6 +70,8 @@ DEFAULT_MERMAID_BATCH_SIZE = 4
 
 DEFAULT_PAGE_MEDIA_TYPE = "print"
 DEFAULT_MD_TO_PDF_RETRIES = 2
+DEFAULT_THEME = "light"
+THEME_CHOICES = ("light", "dark")
 DEFAULT_PDF_OPTIONS = {
     "format": "A4",
     "margin": {"top": "20mm", "bottom": "25mm", "left": "15mm", "right": "15mm"},
@@ -365,6 +369,17 @@ def _normalize_max_size(value):
         return None
 
 
+def _normalize_theme(value, default=DEFAULT_THEME):
+    """Normalize theme settings from YAML/CLI and fall back safely."""
+    if value is None:
+        return default
+    normalized = str(value).strip().lower()
+    if normalized in THEME_CHOICES:
+        return normalized
+    print(f"  [WARN] Ignoring invalid theme value: {value!r}", flush=True)
+    return default
+
+
 def load_launch_options(config_path=None, inline_options=None):
     """Load launch options and normalize browser executable discovery."""
     launch_opts = {}
@@ -521,7 +536,15 @@ def build_render_settings(src_path, metadata, cli_args):
     src_dir = os.path.dirname(src_path)
     wrapper_config = metadata.get("md_to_pdf", {}) if isinstance(metadata.get("md_to_pdf"), dict) else {}
 
-    stylesheets = [_STYLESHEET]
+    theme = _normalize_theme(wrapper_config.get("theme") or metadata.get("theme"))
+    if getattr(cli_args, "theme", None):
+        theme = _normalize_theme(cli_args.theme)
+
+    default_stylesheet = _STYLESHEET_DARK if theme == "dark" else _STYLESHEET
+    default_mermaid_config = _MERMAID_CFG_DARK if theme == "dark" else _MERMAID_CFG
+    mermaid_background = "#0d1117" if theme == "dark" else "white"
+
+    stylesheets = [default_stylesheet]
     stylesheet_values = []
     stylesheet_values.extend(_normalize_list(metadata.get("stylesheet")))
     stylesheet_values.extend(_normalize_list(wrapper_config.get("stylesheet")))
@@ -536,6 +559,7 @@ def build_render_settings(src_path, metadata, cli_args):
     performance_mode = _normalize_bool(wrapper_config.get("performance_mode"), default=False)
 
     settings = {
+        "theme": theme,
         "stylesheets": stylesheets,
         "page_media_type": (
             wrapper_config.get("page_media_type")
@@ -550,7 +574,8 @@ def build_render_settings(src_path, metadata, cli_args):
             config_path=_resolve_path(wrapper_config.get("puppeteer_config"), src_dir) or _PUPPETEER_CFG,
             inline_options=launch_inline,
         ),
-        "mermaid_config_path": _resolve_path(wrapper_config.get("mermaid_config"), src_dir) or _MERMAID_CFG,
+        "mermaid_config_path": _resolve_path(wrapper_config.get("mermaid_config"), src_dir) or default_mermaid_config,
+        "mermaid_background": wrapper_config.get("mermaid_background") or metadata.get("mermaid_background") or mermaid_background,
         "cache_dir": _normalize_cache_dir(wrapper_config.get("cache_dir"), src_dir),
         "performance_mode": performance_mode,
         "mermaid_batch_size": None if performance_mode else DEFAULT_MERMAID_BATCH_SIZE,
@@ -674,10 +699,11 @@ def _render_single_mermaid_block(
     puppeteer_cfg_path=None,
     cache_dir=None,
     cache_key=None,
+    background_color="white",
 ):
     """Render one Mermaid block as a compatibility fallback."""
     svg_path = os.path.join(img_dir, f"d{idx:02d}.svg")
-    mmdc_cmd = [_find_tool("mmdc"), "-i", os.path.join(img_dir, f"d{idx:02d}.mmd"), "-o", svg_path, "-b", "white"]
+    mmdc_cmd = [_find_tool("mmdc"), "-i", os.path.join(img_dir, f"d{idx:02d}.mmd"), "-o", svg_path, "-b", background_color]
     cfg_path = mermaid_config_path or _MERMAID_CFG
     if cfg_path and os.path.isfile(cfg_path):
         mmdc_cmd.extend(["--configFile", cfg_path])
@@ -707,6 +733,7 @@ def _render_mermaid_batch(
     puppeteer_cfg_path=None,
     cache_dir=None,
     cache_keys=None,
+    background_color="white",
 ):
     """Render multiple Mermaid blocks in one mmdc invocation."""
     if not indices:
@@ -737,7 +764,7 @@ def _render_mermaid_batch(
             "-e",
             "svg",
             "-b",
-            "white",
+            background_color,
         ]
         cfg_path = mermaid_config_path or _MERMAID_CFG
         if cfg_path and os.path.isfile(cfg_path):
@@ -799,6 +826,7 @@ def render_diagrams(
     structure=None,
     cache_dir=None,
     batch_size=DEFAULT_MERMAID_BATCH_SIZE,
+    background_color="white",
 ) -> str:
     """Replace Mermaid fences with inline SVG while minimizing renderer startups."""
     structure = structure or parse_markdown_structure(src)
@@ -840,6 +868,7 @@ def render_diagrams(
                 puppeteer_cfg_path=puppeteer_cfg_path,
                 cache_dir=cache_dir,
                 cache_keys=cache_keys,
+                background_color=background_color,
             )
         )
     for idx in failed:
@@ -851,6 +880,7 @@ def render_diagrams(
             puppeteer_cfg_path=puppeteer_cfg_path,
             cache_dir=cache_dir,
             cache_key=cache_keys.get(idx),
+            background_color=background_color,
         )
 
     lines = src.splitlines(True)
@@ -1088,6 +1118,12 @@ def main():
         action="store_true",
         help="Use aggressive full-batch Mermaid rendering for maximum speed",
     )
+    parser.add_argument(
+        "--theme",
+        choices=THEME_CHOICES,
+        default=None,
+        help="Color theme for PDF output (default: light)",
+    )
     args = parser.parse_args()
 
     src_path = os.path.abspath(args.input)
@@ -1131,6 +1167,7 @@ def main():
             structure=structure,
             cache_dir=settings["cache_dir"],
             batch_size=settings["mermaid_batch_size"],
+            background_color=settings["mermaid_background"],
         )
 
         with open(proc_md, "w", encoding="utf-8") as f:
