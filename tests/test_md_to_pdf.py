@@ -325,6 +325,7 @@ class FrontMatterTests(unittest.TestCase):
                 img_dir=str(tmpdir_path / "cli-mermaid"),
                 max_size=9.0,
                 performance_mode=False,
+                theme=None,
             )
 
             with mock.patch.object(module, "_resolve_executable", return_value=sys.executable):
@@ -352,7 +353,7 @@ class FrontMatterTests(unittest.TestCase):
             input_path.write_text("# Title\n", encoding="utf-8")
 
             metadata = {"md_to_pdf": {"cache_dir": False}}
-            cli_args = SimpleNamespace(img_dir=None, max_size=None, performance_mode=False)
+            cli_args = SimpleNamespace(img_dir=None, max_size=None, performance_mode=False, theme=None)
             settings = module.build_render_settings(str(input_path), metadata, cli_args)
 
         self.assertIsNone(settings["cache_dir"])
@@ -365,7 +366,7 @@ class FrontMatterTests(unittest.TestCase):
             input_path.write_text("# Title\n", encoding="utf-8")
 
             metadata = {"md_to_pdf": {"performance_mode": True}}
-            cli_args = SimpleNamespace(img_dir=None, max_size=None, performance_mode=False)
+            cli_args = SimpleNamespace(img_dir=None, max_size=None, performance_mode=False, theme=None)
             settings = module.build_render_settings(str(input_path), metadata, cli_args)
 
         self.assertTrue(settings["performance_mode"])
@@ -379,11 +380,43 @@ class FrontMatterTests(unittest.TestCase):
             input_path.write_text("# Title\n", encoding="utf-8")
 
             metadata = {}
-            cli_args = SimpleNamespace(img_dir=None, max_size=None, performance_mode=True)
+            cli_args = SimpleNamespace(img_dir=None, max_size=None, performance_mode=True, theme=None)
             settings = module.build_render_settings(str(input_path), metadata, cli_args)
 
         self.assertTrue(settings["performance_mode"])
         self.assertIsNone(settings["mermaid_batch_size"])
+
+    def test_build_render_settings_selects_dark_theme_assets(self):
+        module = load_converter_module()
+        with tempfile.TemporaryDirectory(prefix="md-to-pdf-frontmatter-") as tmpdir:
+            tmpdir_path = pathlib.Path(tmpdir)
+            input_path = tmpdir_path / "input.md"
+            input_path.write_text("# Title\n", encoding="utf-8")
+
+            metadata = {"md_to_pdf": {"theme": "dark"}}
+            cli_args = SimpleNamespace(img_dir=None, max_size=None, performance_mode=False, theme=None)
+            settings = module.build_render_settings(str(input_path), metadata, cli_args)
+
+        self.assertEqual(settings["theme"], "dark")
+        self.assertEqual(settings["stylesheets"][0], str(ROOT / "templates" / "technical-dark.css"))
+        self.assertEqual(settings["mermaid_config_path"], str(ROOT / "templates" / "mermaid-config-dark.json"))
+        self.assertEqual(settings["mermaid_background"], "#0d1117")
+
+    def test_cli_theme_overrides_front_matter_theme(self):
+        module = load_converter_module()
+        with tempfile.TemporaryDirectory(prefix="md-to-pdf-frontmatter-") as tmpdir:
+            tmpdir_path = pathlib.Path(tmpdir)
+            input_path = tmpdir_path / "input.md"
+            input_path.write_text("# Title\n", encoding="utf-8")
+
+            metadata = {"md_to_pdf": {"theme": "dark"}}
+            cli_args = SimpleNamespace(img_dir=None, max_size=None, performance_mode=False, theme="light")
+            settings = module.build_render_settings(str(input_path), metadata, cli_args)
+
+        self.assertEqual(settings["theme"], "light")
+        self.assertEqual(settings["stylesheets"][0], str(ROOT / "templates" / "technical.css"))
+        self.assertEqual(settings["mermaid_config_path"], str(ROOT / "templates" / "mermaid-config.json"))
+        self.assertEqual(settings["mermaid_background"], "white")
 
     def test_rewrite_relative_urls_preserves_code_fences_after_prior_rewrites(self):
         module = load_converter_module()
